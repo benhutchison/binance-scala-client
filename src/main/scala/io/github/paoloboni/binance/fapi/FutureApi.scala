@@ -27,13 +27,13 @@ import fs2.Stream
 import io.circe.generic.auto._
 import io.github.paoloboni.binance.common._
 import io.github.paoloboni.binance.common.parameters.TimeParams
-import io.github.paoloboni.binance.common.response.{CirceResponse, KLineStream}
+import io.github.paoloboni.binance.common.response.{CirceResponse, ContractKLineStream, KLineStream}
 import io.github.paoloboni.binance.fapi.parameters._
 import io.github.paoloboni.binance.fapi.response._
 import io.github.paoloboni.binance.{BinanceApi, common, fapi}
 import io.github.paoloboni.encryption.HMAC
 import io.github.paoloboni.http.QueryParamsConverter._
-import io.github.paoloboni.http.ratelimit.RateLimiter
+import io.github.paoloboni.http.ratelimit.RateLimiters
 import io.github.paoloboni.http.{HttpClient, UriOps}
 import org.typelevel.log4cats.Logger
 import sttp.client3.circe.{asJson, circeBodySerializer}
@@ -47,7 +47,7 @@ final case class FutureApi[F[_]: Logger](
     config: FapiConfig[F],
     client: HttpClient[F],
     exchangeInfo: fapi.response.ExchangeInformation,
-    rateLimiters: List[RateLimiter[F]]
+    rateLimiters: RateLimiters[F]
 )(implicit F: Async[F])
     extends BinanceApi[F] {
 
@@ -68,7 +68,7 @@ final case class FutureApi[F[_]: Logger](
         client.get[CirceResponse[List[KLine]]](
           uri = uri,
           responseAs = asJson[List[KLine]],
-          limiters = rateLimiters.filterNot(_.limitType == common.response.RateLimitType.ORDERS)
+          limiters = rateLimiters.requestsOnly
         )
       )
       rawKlines <- Stream.eval(F.fromEither(response))
@@ -100,7 +100,7 @@ final case class FutureApi[F[_]: Logger](
       pricesOrError <- client.get[CirceResponse[List[Price]]](
         uri = uri,
         responseAs = asJson[List[Price]],
-        limiters = rateLimiters.filterNot(_.limitType == common.response.RateLimitType.ORDERS),
+        limiters = rateLimiters.requestsOnly,
         weight = 2
       )
       prices <- F.fromEither(pricesOrError)
@@ -124,7 +124,7 @@ final case class FutureApi[F[_]: Logger](
         .get[CirceResponse[Price]](
           uri = uri,
           responseAs = asJson[Price],
-          limiters = rateLimiters.filterNot(_.limitType == common.response.RateLimitType.ORDERS)
+          limiters = rateLimiters.requestsOnly
         )
       price <- F.fromEither(res)
     } yield price
@@ -156,7 +156,7 @@ final case class FutureApi[F[_]: Logger](
           uri = uri,
           responseAs = ResponseAsByteArray,
           requestBody = None,
-          limiters = rateLimiters,
+          limiters = rateLimiters.value,
           headers = Map("X-MBX-APIKEY" -> config.apiKey)
         )
     } yield ()
@@ -191,7 +191,7 @@ final case class FutureApi[F[_]: Logger](
           uri = uri,
           responseAs = asJson[ChangeInitialLeverageResponse],
           requestBody = None,
-          limiters = rateLimiters,
+          limiters = rateLimiters.value,
           headers = Map("X-MBX-APIKEY" -> config.apiKey)
         )
       response <- F.fromEither(responseOrError)
@@ -220,7 +220,7 @@ final case class FutureApi[F[_]: Logger](
       balanceOrError <- client.get[CirceResponse[FutureAccountInfoResponse]](
         uri = uri,
         responseAs = asJson[FutureAccountInfoResponse],
-        limiters = rateLimiters.filterNot(_.limitType == common.response.RateLimitType.ORDERS),
+        limiters = rateLimiters.requestsOnly,
         headers = Map("X-MBX-APIKEY" -> config.apiKey),
         weight = 5
       )
@@ -260,7 +260,7 @@ final case class FutureApi[F[_]: Logger](
           uri = uri,
           responseAs = asJson[FutureOrderCreateResponse],
           requestBody = None,
-          limiters = rateLimiters,
+          limiters = rateLimiters.value,
           headers = Map("X-MBX-APIKEY" -> config.apiKey)
         )
       response <- F.fromEither(responseOrError)
@@ -296,6 +296,61 @@ final case class FutureApi[F[_]: Logger](
         F.fromEither(Try(uri"${config.wsBaseUrl}/ws/${symbol.toLowerCase}@kline_${interval.toString}").toEither)
       )
       stream <- client.ws[KLineStream](uri)
+    } yield stream
+
+  /** Continuous Contract Kline/Candlestick Streams of updates every 250 milliseconds.
+    *
+    * @param symbol
+    *   the symbol
+    * @param contractType
+    *   the contract type
+    * @param interval
+    *   the interval
+    * @return
+    *   a stream of contract klines
+    */
+  def contractKLineStreams(
+      symbol: String,
+      contractType: FutureContractType,
+      interval: Interval
+  ): Stream[F, ContractKLineStream] =
+    for {
+      uri <- Stream.eval(
+        F.fromEither(
+          Try(
+            uri"${config.wsBaseUrl}/ws/${symbol.toLowerCase}_${contractType.toString.toLowerCase}@continuousKline_${interval.toString}"
+          ).toEither
+        )
+      )
+      stream <- client.ws[ContractKLineStream](uri)
+    } yield stream
+
+  /** Mark price and funding rate for a single symbol pushed every 3 seconds
+    *
+    * @param symbol
+    *   the symbol
+    * @return
+    *   a stream of mark price updates
+    */
+  def markPriceStream(symbol: String): Stream[F, MarkPriceUpdate] =
+    for {
+      uri <- Stream.eval(
+        F.fromEither(Try(uri"${config.wsBaseUrl}/ws/${symbol.toLowerCase}@markPrice").toEither)
+      )
+      stream <- client.ws[MarkPriceUpdate](uri)
+    } yield stream
+
+  /** Mark price and funding rate for all symbols pushed every 3 seconds
+    *
+    * @return
+    *   a stream of mark price updates
+    */
+  def markPriceStream(): Stream[F, MarkPriceUpdate] =
+    for {
+      uri <- Stream.eval(
+        F.fromEither(Try(uri"${config.wsBaseUrl}/ws/!markPrice@arr").toEither)
+      )
+      stream <- client.ws[List[MarkPriceUpdate]](uri).flatMap(Stream.emits(_))
     } yield stream
 }
 

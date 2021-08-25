@@ -13,6 +13,8 @@ on:
       - 'src/**'
       - 'project/**'
       - '**/*.sbt'
+  schedule:
+    - cron: '0 0 * * 0'
 jobs:
   test:
     strategy:
@@ -76,3 +78,4 @@ jobs:
           SPOT_SECRET_KEY: ${{ secrets.SPOT_SECRET_KEY }}
         run: sbt ++${{ matrix.scala }} e2e:test
         shell: bash
+        timeout-minutes: 10

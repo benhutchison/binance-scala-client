@@ -28,12 +28,13 @@ import io.circe.generic.auto._
 import io.github.paoloboni.binance.common._
 import io.github.paoloboni.binance.common.parameters.TimeParams
 import io.github.paoloboni.binance.common.response._
+import io.github.paoloboni.binance.fapi.response.AggregateTradeStream
 import io.github.paoloboni.binance.spot.parameters._
 import io.github.paoloboni.binance.spot.response._
 import io.github.paoloboni.binance.{BinanceApi, common, spot}
 import io.github.paoloboni.encryption.HMAC
 import io.github.paoloboni.http.QueryParamsConverter._
-import io.github.paoloboni.http.ratelimit.RateLimiter
+import io.github.paoloboni.http.ratelimit.RateLimiters
 import io.github.paoloboni.http.{HttpClient, UriOps}
 import org.typelevel.log4cats.Logger
 import sttp.client3.UriContext
@@ -41,13 +42,12 @@ import sttp.client3.circe.{asJson, _}
 
 import java.time.Instant
 import scala.util.Try
-import sttp.model.QueryParams
 
 final case class SpotApi[F[_]: Logger](
     config: SpotConfig[F],
     client: HttpClient[F],
     exchangeInfo: spot.response.ExchangeInformation,
-    rateLimiters: List[RateLimiter[F]]
+    rateLimiters: RateLimiters[F]
 )(implicit F: Async[F])
     extends BinanceApi[F] {
 
@@ -62,13 +62,13 @@ final case class SpotApi[F[_]: Logger](
     for {
       uri <- F.fromEither(
         Try(uri"${config.restBaseUrl}/api/v3/depth")
-          .map(_.addParams(QueryParams.fromMap(Map("symbol" -> query.symbol, "limit" -> query.limit.toString))))
+          .map(_.addParams(query.toQueryParams))
           .toEither
       )
       depthOrError <- client.get[CirceResponse[Depth]](
         uri = uri,
         responseAs = asJson[Depth],
-        limiters = rateLimiters.filterNot(_.limitType == common.response.RateLimitType.ORDERS),
+        limiters = rateLimiters.requestsOnly,
         weight = query.limit.weight
       )
       depth <- F.fromEither(depthOrError)
@@ -91,7 +91,7 @@ final case class SpotApi[F[_]: Logger](
         client.get[CirceResponse[List[KLine]]](
           uri = uri,
           responseAs = asJson[List[KLine]],
-          limiters = rateLimiters.filterNot(_.limitType == common.response.RateLimitType.ORDERS)
+          limiters = rateLimiters.requestsOnly
         )
       )
       rawKlines <- Stream.eval(F.fromEither(response))
@@ -122,7 +122,7 @@ final case class SpotApi[F[_]: Logger](
       pricesOrError <- client.get[CirceResponse[List[Price]]](
         uri = uri,
         responseAs = asJson[List[Price]],
-        limiters = rateLimiters.filterNot(_.limitType == common.response.RateLimitType.ORDERS),
+        limiters = rateLimiters.requestsOnly,
         weight = 2
       )
       prices <- F.fromEither(pricesOrError)
@@ -148,7 +148,7 @@ final case class SpotApi[F[_]: Logger](
       responseOrError <- client.get[CirceResponse[SpotAccountInfoResponse]](
         uri = uri,
         responseAs = asJson[SpotAccountInfoResponse],
-        limiters = rateLimiters.filterNot(_.limitType == common.response.RateLimitType.ORDERS),
+        limiters = rateLimiters.requestsOnly,
         headers = Map("X-MBX-APIKEY" -> config.apiKey),
         weight = 10
       )
@@ -185,7 +185,7 @@ final case class SpotApi[F[_]: Logger](
           uri = uri,
           responseAs = asJson[SpotOrderCreateResponse],
           requestBody = None,
-          limiters = rateLimiters,
+          limiters = rateLimiters.value,
           headers = Map("X-MBX-APIKEY" -> config.apiKey)
         )
       response <- F.fromEither(responseOrError)
@@ -218,7 +218,7 @@ final case class SpotApi[F[_]: Logger](
         .delete[CirceResponse[io.circe.Json]](
           uri = uri,
           responseAs = asJson[io.circe.Json],
-          limiters = rateLimiters,
+          limiters = rateLimiters.value,
           headers = Map("X-MBX-APIKEY" -> config.apiKey)
         )
       _ <- F.fromEither(res)
@@ -253,7 +253,7 @@ final case class SpotApi[F[_]: Logger](
         .delete[CirceResponse[io.circe.Json]](
           uri = uri,
           responseAs = asJson[io.circe.Json],
-          limiters = rateLimiters,
+          limiters = rateLimiters.value,
           headers = Map("X-MBX-APIKEY" -> config.apiKey)
         )
       _ <- F.fromEither(res)
@@ -331,6 +331,20 @@ final case class SpotApi[F[_]: Logger](
     for {
       uri    <- Stream.eval(F.fromEither(Try(uri"${config.wsBaseUrl}/ws/!bookTicker").toEither))
       stream <- client.ws[BookTicker](uri)
+    } yield stream
+
+  /** The Aggregate Trade Streams push trade information that is aggregated for a single taker order every 100
+    * milliseconds.
+    *
+    * @param symbol
+    *   the symbol
+    * @return
+    *   a stream of aggregate trade events
+    */
+  def aggregateTradeStreams(symbol: String): Stream[F, AggregateTradeStream] =
+    for {
+      uri    <- Stream.eval(F.fromEither(Try(uri"${config.wsBaseUrl}/ws/${symbol.toLowerCase}@aggTrade").toEither))
+      stream <- client.ws[AggregateTradeStream](uri)
     } yield stream
 }
 
